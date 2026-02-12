@@ -6,13 +6,13 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Color helpers ────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+NC=$'\033[0m' # No Color
 
 info()    { printf "${BLUE}[INFO]${NC}  %s\n" "$*"; }
 success() { printf "${GREEN}[OK]${NC}    %s\n" "$*"; }
@@ -23,10 +23,11 @@ header()  { printf "\n${BOLD}${CYAN}── %s ──${NC}\n\n" "$*"; }
 # ── Cleanup trap ─────────────────────────────────────────────────────────────
 TEMPFILES=()
 cleanup() {
+    local exit_code=$?
     for f in "${TEMPFILES[@]:-}"; do
         rm -f "$f"
     done
-    if [[ $? -ne 0 ]]; then
+    if [[ $exit_code -ne 0 ]]; then
         echo ""
         warn "Script exited early. Your settings have NOT been changed."
     fi
@@ -88,6 +89,8 @@ MODEL_ARN=""
 SMALL_FAST_MODEL=""
 ENABLE_AUTH_REFRESH=false
 HAS_AWS_CLI=false
+MODEL_NAMES=()
+MODEL_ARNS=()
 
 # ═════════════════════════════════════════════════════════════════════════════
 echo ""
@@ -364,7 +367,7 @@ discover_models() {
         profile_flag="--profile $AWS_PROFILE_NAME"
     fi
 
-    info "Discovering available inference profiles in $AWS_REGION…"
+    info "Discovering available inference profiles in ${AWS_REGION}…"
     echo ""
 
     local raw
@@ -391,8 +394,8 @@ discover_models() {
         return 1
     fi
 
-    declare -g -a MODEL_NAMES=()
-    declare -g -a MODEL_ARNS=()
+    MODEL_NAMES=()
+    MODEL_ARNS=()
     local i=1
     while IFS=$'\t' read -r name arn status; do
         MODEL_NAMES+=("$name")
@@ -464,7 +467,7 @@ success "Primary model: $MODEL_ARN"
 echo ""
 info "Claude Code can use a smaller, faster model for lightweight tasks (e.g. Haiku)."
 if prompt_yes_no "Configure a small/fast model (ANTHROPIC_SMALL_FAST_MODEL)?" "n"; then
-    if $HAS_AWS_CLI && [[ ${#MODEL_ARNS[@]:-0} -gt 0 ]]; then
+    if $HAS_AWS_CLI && [[ ${#MODEL_ARNS[@]} -gt 0 ]]; then
         echo ""
         info "Pick from discovered models, or enter an ARN:"
         for i in "${!MODEL_NAMES[@]}"; do
@@ -506,21 +509,6 @@ if [[ -f "$SETTINGS_FILE" ]]; then
     success "Backed up existing settings to $BACKUP"
 fi
 
-# Build the new env block values
-declare -A NEW_ENV=(
-    ["CLAUDE_CODE_USE_BEDROCK"]="1"
-    ["AWS_REGION"]="$AWS_REGION"
-    ["ANTHROPIC_MODEL"]="$MODEL_ARN"
-)
-
-if [[ -n "$AWS_PROFILE_NAME" ]]; then
-    NEW_ENV["AWS_PROFILE"]="$AWS_PROFILE_NAME"
-fi
-
-if [[ -n "$SMALL_FAST_MODEL" ]]; then
-    NEW_ENV["ANTHROPIC_SMALL_FAST_MODEL"]="$SMALL_FAST_MODEL"
-fi
-
 # Determine JSON tool
 JSON_TOOL=""
 if command -v jq &>/dev/null; then
@@ -538,10 +526,19 @@ merge_with_jq() {
     fi
 
     # Build env additions as a JSON object
-    local env_json="{}"
-    for key in "${!NEW_ENV[@]}"; do
-        env_json="$(echo "$env_json" | jq --arg k "$key" --arg v "${NEW_ENV[$key]}" '. + {($k): $v}')"
-    done
+    local env_json
+    env_json="$(jq -n \
+        --arg bedrock "1" \
+        --arg region "$AWS_REGION" \
+        --arg model "$MODEL_ARN" \
+        '{ "CLAUDE_CODE_USE_BEDROCK": $bedrock, "AWS_REGION": $region, "ANTHROPIC_MODEL": $model }')"
+
+    if [[ -n "$AWS_PROFILE_NAME" ]]; then
+        env_json="$(echo "$env_json" | jq --arg v "$AWS_PROFILE_NAME" '. + { "AWS_PROFILE": $v }')"
+    fi
+    if [[ -n "$SMALL_FAST_MODEL" ]]; then
+        env_json="$(echo "$env_json" | jq --arg v "$SMALL_FAST_MODEL" '. + { "ANTHROPIC_SMALL_FAST_MODEL": $v }')"
+    fi
 
     # Merge env into existing .env (preserving other env vars)
     local result
@@ -562,23 +559,26 @@ merge_with_python() {
         existing="$(cat "$SETTINGS_FILE")"
     fi
 
-    # Pass values via environment to avoid shell escaping issues
-    ENV_JSON="$(python3 -c "
-import json, sys
-d = {}
-pairs = sys.argv[1:]
-for i in range(0, len(pairs), 2):
-    d[pairs[i]] = pairs[i+1]
-print(json.dumps(d))
-" "${!NEW_ENV[@]/#/}" $(for k in "${!NEW_ENV[@]}"; do echo "$k"; echo "${NEW_ENV[$k]}"; done))"
-
     python3 -c "
 import json, sys
 
 existing = json.loads(sys.argv[1])
-new_env = json.loads(sys.argv[2])
-enable_auth = sys.argv[3] == 'true'
-profile = sys.argv[4]
+enable_auth = sys.argv[2] == 'true'
+profile = sys.argv[3]
+region = sys.argv[4]
+model = sys.argv[5]
+aws_profile = sys.argv[6]
+small_model = sys.argv[7]
+
+new_env = {
+    'CLAUDE_CODE_USE_BEDROCK': '1',
+    'AWS_REGION': region,
+    'ANTHROPIC_MODEL': model,
+}
+if aws_profile:
+    new_env['AWS_PROFILE'] = aws_profile
+if small_model:
+    new_env['ANTHROPIC_SMALL_FAST_MODEL'] = small_model
 
 existing.setdefault('env', {})
 existing['env'].update(new_env)
@@ -587,7 +587,7 @@ if enable_auth and profile:
     existing['awsAuthRefresh'] = 'aws sso login --profile ' + profile
 
 print(json.dumps(existing, indent=2))
-" "$existing" "$ENV_JSON" "$ENABLE_AUTH_REFRESH" "$AWS_PROFILE_NAME" > "$SETTINGS_FILE"
+" "$existing" "$ENABLE_AUTH_REFRESH" "$AWS_PROFILE_NAME" "$AWS_REGION" "$MODEL_ARN" "$AWS_PROFILE_NAME" "$SMALL_FAST_MODEL" > "$SETTINGS_FILE"
 }
 
 merge_fallback() {
@@ -687,7 +687,7 @@ fi
 # ═════════════════════════════════════════════════════════════════════════════
 header "Step 9 / 9 — Summary"
 
-echo "Configuration written to ${BOLD}$SETTINGS_FILE${NC}:"
+printf "Configuration written to %s%s%s:\n" "$BOLD" "$SETTINGS_FILE" "$NC"
 echo ""
 
 if command -v cat &>/dev/null; then
